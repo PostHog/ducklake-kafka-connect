@@ -177,7 +177,7 @@ jobs:
         uses: github/codeql-action/upload-sarif@v3
         if: always()
         with:
-          sarif_file: build/reports/spotbugs/sarif.sarif
+          sarif_file: build/reports/spotbugs/
           category: spotbugs
 
   build:
@@ -252,18 +252,8 @@ jobs:
         run: ./gradlew dependencyCheckAnalyze || true
         continue-on-error: true
 
-      - name: Initialize CodeQL
-        uses: github/codeql-action/init@v3
-        with:
-          languages: java
-
-      - name: Autobuild
-        uses: github/codeql-action/autobuild@v3
-
-      - name: Perform CodeQL Analysis
-        uses: github/codeql-action/analyze@v3
-        with:
-          category: "/language:java"
+      # CodeQL analysis is handled by GitHub's default setup
+      # Remove advanced CodeQL steps to avoid conflict with default setup
 
   dependency-review:
     name: Dependency Review
@@ -333,6 +323,21 @@ jobs:
           echo "**Author:** ${{ github.event.head_commit.author.name }}" >> $GITHUB_OUTPUT
           echo "EOF" >> $GITHUB_OUTPUT
 
+      - name: Calculate next version
+        id: version
+        run: |
+          # Get the latest v0.0.X tag and increment
+          LATEST_TAG=$(git tag -l 'v0.0.*' | sort -t. -k3 -n | tail -1)
+          if [ -z "$LATEST_TAG" ]; then
+            NEXT_VERSION="v0.0.1"
+          else
+            CURRENT_PATCH=$(echo "$LATEST_TAG" | sed 's/v0\.0\.//')
+            NEXT_PATCH=$((CURRENT_PATCH + 1))
+            NEXT_VERSION="v0.0.$NEXT_PATCH"
+          fi
+          echo "version=$NEXT_VERSION" >> $GITHUB_OUTPUT
+          echo "Next version: $NEXT_VERSION"
+
       - name: Create release
         uses: softprops/action-gh-release@v1
         with:
@@ -340,8 +345,8 @@ jobs:
             build/libs/*.jar
             build/distributions/*.tar
             build/distributions/*.zip
-          tag_name: v0.0.${{ github.run_number }}
-          name: v0.0.${{ github.run_number }} (${{ steps.sha.outputs.short }})
+          tag_name: ${{ steps.version.outputs.version }}
+          name: ${{ steps.version.outputs.version }} (${{ steps.sha.outputs.short }})
           body: ${{ steps.notes.outputs.notes }}
           draft: false
           prerelease: false

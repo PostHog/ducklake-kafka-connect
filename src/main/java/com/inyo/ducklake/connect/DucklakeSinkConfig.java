@@ -20,6 +20,7 @@ import java.util.HashSet;
 import java.util.Map;
 import java.util.OptionalInt;
 import java.util.Set;
+import java.util.regex.Pattern;
 import org.apache.kafka.common.config.AbstractConfig;
 import org.apache.kafka.common.config.ConfigDef;
 import org.apache.kafka.common.config.ConfigException;
@@ -28,6 +29,11 @@ public class DucklakeSinkConfig extends AbstractConfig {
 
   /** This class used iceberg-kafka-connect as reference implementation */
   public static final String VERSION = "1.0.0";
+
+  // Data path validation patterns
+  private static final Pattern S3_PATH_PATTERN = Pattern.compile("^s3a?://[a-zA-Z0-9._-]+(/.*)?$");
+  private static final Pattern GCS_PATH_PATTERN = Pattern.compile("^gs://[a-zA-Z0-9._-]+(/.*)?$");
+  private static final Pattern LOCAL_PATH_PATTERN = Pattern.compile("^file:///.+$");
 
   public static final String DUCKLAKE_CATALOG_URI = "ducklake.catalog_uri";
   public static final String DATA_INLINING_ROW_LIMIT = "data.inlining.row.limit";
@@ -48,6 +54,10 @@ public class DucklakeSinkConfig extends AbstractConfig {
   public static final String FLUSH_INTERVAL_MS = "flush.interval.ms";
   public static final String FILE_SIZE_BYTES = "file.size.bytes";
 
+  // Performance tuning
+  public static final String DUCKDB_THREADS = "duckdb.threads";
+  public static final String PARALLEL_PARTITION_FLUSH = "parallel.partition.flush";
+
   // Table-specific configuration property patterns
   static final String TABLE_ID_COLUMNS_PATTERN = "ducklake.table.%s.id-columns";
   static final String TABLE_PARTITION_BY_PATTERN = "ducklake.table.%s.partition-by";
@@ -57,7 +67,7 @@ public class DucklakeSinkConfig extends AbstractConfig {
     return new ConfigDef()
         .define(
             DUCKLAKE_CATALOG_URI,
-            ConfigDef.Type.STRING,
+            ConfigDef.Type.PASSWORD,
             ConfigDef.Importance.HIGH,
             "Ducklake catalog URI, e.g., postgres:dbname=ducklake_catalog host=localhost")
         .define(
@@ -77,6 +87,8 @@ public class DucklakeSinkConfig extends AbstractConfig {
         .define(
             DATA_PATH,
             ConfigDef.Type.STRING,
+            ConfigDef.NO_DEFAULT_VALUE,
+            new DataPathValidator(),
             ConfigDef.Importance.HIGH,
             "Data path in the format eg s3://my-bucket/path/, gs://my-bucket/path/, file:///path/")
         .define(
@@ -93,12 +105,12 @@ public class DucklakeSinkConfig extends AbstractConfig {
             "Specify a custom S3 endpoint")
         .define(
             S3_ACCESS_KEY_ID,
-            ConfigDef.Type.STRING,
+            ConfigDef.Type.PASSWORD,
             ConfigDef.Importance.HIGH,
             "The ID of the key to use")
         .define(
             S3_SECRET_ACCESS_KEY,
-            ConfigDef.Type.STRING,
+            ConfigDef.Type.PASSWORD,
             ConfigDef.Importance.HIGH,
             "The secret of the key to use")
         .define(
@@ -127,7 +139,20 @@ public class DucklakeSinkConfig extends AbstractConfig {
             268435456L,
             ConfigDef.Importance.MEDIUM,
             "Target file size in bytes before flushing the buffer. "
-                + "Default: 268435456 (256MB). Set to 536870912 for 512MB files.");
+                + "Default: 268435456 (256MB). Set to 536870912 for 512MB files.")
+        .define(
+            DUCKDB_THREADS,
+            ConfigDef.Type.INT,
+            0,
+            ConfigDef.Importance.MEDIUM,
+            "Number of threads for DuckDB to use. 0 means use all available processors. "
+                + "Default: 0 (all cores)")
+        .define(
+            PARALLEL_PARTITION_FLUSH,
+            ConfigDef.Type.BOOLEAN,
+            true,
+            ConfigDef.Importance.MEDIUM,
+            "Enable parallel flushing of partitions for higher throughput. Default: true");
   }
 
   public DucklakeSinkConfig(ConfigDef definition, Map<?, ?> originals) {
@@ -135,7 +160,7 @@ public class DucklakeSinkConfig extends AbstractConfig {
   }
 
   public String getDucklakeCatalogUri() {
-    return getString(DUCKLAKE_CATALOG_URI);
+    return getPassword(DUCKLAKE_CATALOG_URI).value();
   }
 
   public String getS3UrlStyle() {
@@ -151,11 +176,11 @@ public class DucklakeSinkConfig extends AbstractConfig {
   }
 
   public String getS3AccessKeyId() {
-    return getString(S3_ACCESS_KEY_ID);
+    return getPassword(S3_ACCESS_KEY_ID).value();
   }
 
   public String getS3SecretAccessKey() {
-    return getString(S3_SECRET_ACCESS_KEY);
+    return getPassword(S3_SECRET_ACCESS_KEY).value();
   }
 
   public String getDataPath() {
@@ -194,8 +219,29 @@ public class DucklakeSinkConfig extends AbstractConfig {
   }
 
   /**
+   * Returns the number of threads DuckDB should use for parallel processing.
    *
-   * <p>Default is 'off' (data inlining disabled). If value is the string "off" (case-insensitive),
+   * @return number of threads, 0 means use all available processors
+   */
+  public int getDuckDbThreads() {
+    int threads = getInt(DUCKDB_THREADS);
+    if (threads <= 0) {
+      return Runtime.getRuntime().availableProcessors();
+    }
+    return threads;
+  }
+
+  /**
+   * Returns whether parallel partition flushing is enabled.
+   *
+   * @return true if parallel partition flush is enabled, default true
+   */
+  public boolean isParallelPartitionFlushEnabled() {
+    return getBoolean(PARALLEL_PARTITION_FLUSH);
+  }
+
+  /**
+   * Default is 'off' (data inlining disabled). If value is the string "off" (case-insensitive),
    * data inlining is disabled and an empty OptionalInt is returned.
    */
   public OptionalInt getDataInliningRowLimit() {
@@ -338,5 +384,38 @@ public class DucklakeSinkConfig extends AbstractConfig {
       out.put(String.valueOf(e.getKey()), e.getValue() != null ? String.valueOf(e.getValue()) : "");
     }
     return out;
+  }
+
+  /** Validator for data path configuration (S3, GCS, or local file paths). */
+  static class DataPathValidator implements ConfigDef.Validator {
+    @Override
+    public void ensureValid(String name, Object value) {
+      if (value == null) {
+        throw new ConfigException(name, null, "Data path is required");
+      }
+      String path = value.toString().trim();
+      if (path.isEmpty()) {
+        throw new ConfigException(name, value, "Data path cannot be empty");
+      }
+
+      boolean isValidPath =
+          S3_PATH_PATTERN.matcher(path).matches()
+              || GCS_PATH_PATTERN.matcher(path).matches()
+              || LOCAL_PATH_PATTERN.matcher(path).matches();
+
+      if (!isValidPath) {
+        throw new ConfigException(
+            name,
+            value,
+            "Invalid data path format. Expected one of: "
+                + "s3://bucket-name/path, s3a://bucket-name/path, "
+                + "gs://bucket-name/path, or file:///absolute/path");
+      }
+    }
+
+    @Override
+    public String toString() {
+      return "Valid data path (s3://, s3a://, gs://, or file:///)";
+    }
   }
 }
