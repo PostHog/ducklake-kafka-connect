@@ -486,8 +486,7 @@ class ArrowSchemaMergeTest {
       // Error message should help identify the problem
       assertTrue(exception.getMessage().contains("distinct_id"));
       assertTrue(
-          exception.getMessage().contains("Timestamp")
-              || exception.getMessage().contains("Utf8"));
+          exception.getMessage().contains("Timestamp") || exception.getMessage().contains("Utf8"));
     }
   }
 
