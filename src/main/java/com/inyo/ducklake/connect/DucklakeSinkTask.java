@@ -510,8 +510,8 @@ public class DucklakeSinkTask extends SinkTask {
   }
 
   /**
-   * Consolidates multiple VectorSchemaRoot batches into a single VectorSchemaRoot.
-   * This reduces the number of write operations to DuckLake, improving throughput.
+   * Consolidates multiple VectorSchemaRoot batches into a single VectorSchemaRoot. This reduces the
+   * number of write operations to DuckLake, improving throughput.
    */
   private VectorSchemaRoot consolidateBatches(List<VectorSchemaRoot> batches) {
     if (batches == null || batches.isEmpty()) {
