@@ -15,6 +15,7 @@
  */
 package com.inyo.ducklake.connect;
 
+import com.inyo.ducklake.ingestor.ArrowSchemaMerge;
 import com.inyo.ducklake.ingestor.DucklakeWriter;
 import edu.umd.cs.findbugs.annotations.SuppressFBWarnings;
 import java.sql.SQLException;
@@ -33,10 +34,18 @@ import java.util.concurrent.ThreadLocalRandom;
 import java.util.concurrent.TimeUnit;
 import java.util.concurrent.atomic.AtomicInteger;
 import java.util.concurrent.locks.ReentrantLock;
+import java.util.stream.Collectors;
 import org.apache.arrow.memory.BufferAllocator;
 import org.apache.arrow.memory.RootAllocator;
+import org.apache.arrow.vector.BigIntVector;
 import org.apache.arrow.vector.FieldVector;
+import org.apache.arrow.vector.Float4Vector;
+import org.apache.arrow.vector.Float8Vector;
+import org.apache.arrow.vector.IntVector;
+import org.apache.arrow.vector.SmallIntVector;
+import org.apache.arrow.vector.TinyIntVector;
 import org.apache.arrow.vector.VectorSchemaRoot;
+import org.apache.arrow.vector.types.pojo.ArrowType;
 import org.apache.arrow.vector.types.pojo.Field;
 import org.apache.arrow.vector.types.pojo.Schema;
 import org.apache.arrow.vector.util.VectorBatchAppender;
@@ -688,28 +697,18 @@ public class DucklakeSinkTask extends SinkTask {
   }
 
   /**
-   * Consolidates multiple VectorSchemaRoot batches into a single VectorSchemaRoot. This reduces the
-   * number of write operations to DuckLake, improving throughput. Returns null if batches have
-   * incompatible schemas (caller should fall back to writing individually).
+   * Casts a VectorSchemaRoot to a target schema. This handles: - Missing fields: filled with nulls
+   * - Type promotions: Int32 to Int64, Float32 to Float64 - Field reordering: fields are matched by
+   * name
+   *
+   * @param source The source batch to cast
+   * @param targetSchema The target schema to cast to
+   * @return A new VectorSchemaRoot with the target schema, or null if casting fails
    */
-  private VectorSchemaRoot consolidateBatches(List<VectorSchemaRoot> batches) {
-    if (batches == null || batches.isEmpty()) {
-      return null;
-    }
-
-    // Check if all batches have compatible schemas
-    if (!haveSameSchema(batches)) {
-      LOG.warn(
-          "Cannot consolidate {} batches due to schema mismatch - will write individually",
-          batches.size());
-      return null;
-    }
-
-    if (batches.size() == 1) {
-      // Single batch - no consolidation needed, but we need to copy it since
-      // the original will be closed separately
-      VectorSchemaRoot source = batches.get(0);
-      VectorSchemaRoot copy = VectorSchemaRoot.create(source.getSchema(), allocator);
+  private VectorSchemaRoot castBatchToSchema(VectorSchemaRoot source, Schema targetSchema) {
+    if (source.getSchema().equals(targetSchema)) {
+      // Schemas are identical - just copy
+      VectorSchemaRoot copy = VectorSchemaRoot.create(targetSchema, allocator);
       try {
         copy.allocateNew();
         for (int i = 0; i < source.getFieldVectors().size(); i++) {
@@ -722,29 +721,307 @@ public class DucklakeSinkTask extends SinkTask {
         copy.setRowCount(source.getRowCount());
         return copy;
       } catch (Exception e) {
-        // Clean up on failure to prevent memory leak
         try {
           copy.close();
         } catch (Exception closeEx) {
-          LOG.warn("Failed to close copy root during cleanup: {}", closeEx.getMessage());
+          LOG.warn("Failed to close copy during cleanup: {}", closeEx.getMessage());
         }
         throw e;
       }
     }
 
-    // Use schema from first batch
-    Schema schema = batches.get(0).getSchema();
+    // Build a map of source fields by name for quick lookup
+    Map<String, FieldVector> sourceVectorsByName = new HashMap<>();
+    for (FieldVector vector : source.getFieldVectors()) {
+      sourceVectorsByName.put(vector.getName(), vector);
+    }
+
+    VectorSchemaRoot result = VectorSchemaRoot.create(targetSchema, allocator);
+    try {
+      result.allocateNew();
+      int rowCount = source.getRowCount();
+
+      for (FieldVector targetVector : result.getFieldVectors()) {
+        String fieldName = targetVector.getName();
+        FieldVector sourceVector = sourceVectorsByName.get(fieldName);
+
+        if (sourceVector == null) {
+          // Field doesn't exist in source - fill with nulls
+          for (int row = 0; row < rowCount; row++) {
+            targetVector.setNull(row);
+          }
+        } else if (sourceVector.getField().getType().equals(targetVector.getField().getType())) {
+          // Same type - direct copy
+          for (int row = 0; row < rowCount; row++) {
+            targetVector.copyFromSafe(row, row, sourceVector);
+          }
+        } else {
+          // Different types - need to cast
+          if (!castVectorValues(sourceVector, targetVector, rowCount)) {
+            // Casting failed - clean up and return null
+            try {
+              result.close();
+            } catch (Exception closeEx) {
+              LOG.warn("Failed to close result during cleanup: {}", closeEx.getMessage());
+            }
+            return null;
+          }
+        }
+      }
+
+      result.setRowCount(rowCount);
+      return result;
+    } catch (Exception e) {
+      try {
+        result.close();
+      } catch (Exception closeEx) {
+        LOG.warn("Failed to close result during cleanup: {}", closeEx.getMessage());
+      }
+      throw e;
+    }
+  }
+
+  /**
+   * Casts values from source vector to target vector. Handles common type promotions.
+   *
+   * @return true if casting succeeded, false if types are incompatible
+   */
+  private boolean castVectorValues(FieldVector source, FieldVector target, int rowCount) {
+    ArrowType sourceType = source.getField().getType();
+    ArrowType targetType = target.getField().getType();
+
+    // TinyInt (Int8) to Int64 promotion
+    if (source instanceof TinyIntVector tinyIntSource
+        && target instanceof BigIntVector bigIntTarget) {
+      for (int row = 0; row < rowCount; row++) {
+        if (tinyIntSource.isNull(row)) {
+          bigIntTarget.setNull(row);
+        } else {
+          bigIntTarget.setSafe(row, tinyIntSource.get(row));
+        }
+      }
+      return true;
+    }
+
+    // SmallInt (Int16) to Int64 promotion
+    if (source instanceof SmallIntVector smallIntSource
+        && target instanceof BigIntVector bigIntTarget) {
+      for (int row = 0; row < rowCount; row++) {
+        if (smallIntSource.isNull(row)) {
+          bigIntTarget.setNull(row);
+        } else {
+          bigIntTarget.setSafe(row, smallIntSource.get(row));
+        }
+      }
+      return true;
+    }
+
+    // Int32 to Int64 promotion
+    if (source instanceof IntVector intSource && target instanceof BigIntVector bigIntTarget) {
+      for (int row = 0; row < rowCount; row++) {
+        if (intSource.isNull(row)) {
+          bigIntTarget.setNull(row);
+        } else {
+          bigIntTarget.setSafe(row, intSource.get(row));
+        }
+      }
+      return true;
+    }
+
+    // Float32 to Float64 promotion
+    if (source instanceof Float4Vector float4Source
+        && target instanceof Float8Vector float8Target) {
+      for (int row = 0; row < rowCount; row++) {
+        if (float4Source.isNull(row)) {
+          float8Target.setNull(row);
+        } else {
+          float8Target.setSafe(row, float4Source.get(row));
+        }
+      }
+      return true;
+    }
+
+    // TinyInt to Float64 promotion
+    if (source instanceof TinyIntVector tinyIntSource
+        && target instanceof Float8Vector float8Target) {
+      for (int row = 0; row < rowCount; row++) {
+        if (tinyIntSource.isNull(row)) {
+          float8Target.setNull(row);
+        } else {
+          float8Target.setSafe(row, tinyIntSource.get(row));
+        }
+      }
+      return true;
+    }
+
+    // SmallInt to Float64 promotion
+    if (source instanceof SmallIntVector smallIntSource
+        && target instanceof Float8Vector float8Target) {
+      for (int row = 0; row < rowCount; row++) {
+        if (smallIntSource.isNull(row)) {
+          float8Target.setNull(row);
+        } else {
+          float8Target.setSafe(row, smallIntSource.get(row));
+        }
+      }
+      return true;
+    }
+
+    // Int32 to Float64 promotion
+    if (source instanceof IntVector intSource && target instanceof Float8Vector float8Target) {
+      for (int row = 0; row < rowCount; row++) {
+        if (intSource.isNull(row)) {
+          float8Target.setNull(row);
+        } else {
+          float8Target.setSafe(row, intSource.get(row));
+        }
+      }
+      return true;
+    }
+
+    // Int64 to Float64 promotion
+    if (source instanceof BigIntVector bigIntSource
+        && target instanceof Float8Vector float8Target) {
+      for (int row = 0; row < rowCount; row++) {
+        if (bigIntSource.isNull(row)) {
+          float8Target.setNull(row);
+        } else {
+          float8Target.setSafe(row, bigIntSource.get(row));
+        }
+      }
+      return true;
+    }
+
+    // For other compatible types, try copyFromSafe (works for same-type with different nullability)
+    try {
+      for (int row = 0; row < rowCount; row++) {
+        target.copyFromSafe(row, row, source);
+      }
+      return true;
+    } catch (Exception e) {
+      LOG.debug("Cannot cast from {} to {}: {}", sourceType, targetType, e.getMessage());
+      return false;
+    }
+  }
+
+  /**
+   * Consolidates multiple VectorSchemaRoot batches into a single VectorSchemaRoot. This reduces the
+   * number of write operations to DuckLake, improving throughput.
+   *
+   * <p>If batches have different schemas, attempts to unify them using ArrowSchemaMerge and cast
+   * each batch to the unified schema. Returns null only if schema unification fails (caller should
+   * fall back to writing individually).
+   */
+  private VectorSchemaRoot consolidateBatches(List<VectorSchemaRoot> batches) {
+    if (batches == null || batches.isEmpty()) {
+      return null;
+    }
+
+    // Fast path: if all schemas are identical, skip unification
+    boolean schemasMatch = haveSameSchema(batches);
+
+    Schema unifiedSchema;
+    List<VectorSchemaRoot> unifiedBatches;
+
+    if (schemasMatch) {
+      // All schemas match - use as-is
+      unifiedSchema = batches.get(0).getSchema();
+      unifiedBatches = batches;
+    } else {
+      // Schemas differ - try to unify them
+      List<Schema> schemas =
+          batches.stream().map(VectorSchemaRoot::getSchema).collect(Collectors.toList());
+
+      try {
+        unifiedSchema = ArrowSchemaMerge.unifySchemas(schemas, () -> Map.of());
+        LOG.debug(
+            "Unified {} different schemas into single schema with {} fields",
+            batches.size(),
+            unifiedSchema.getFields().size());
+      } catch (IllegalArgumentException e) {
+        // Schema unification failed - truly incompatible types
+        LOG.warn(
+            "Cannot unify {} batch schemas - will write individually: {}",
+            batches.size(),
+            e.getMessage());
+        return null;
+      }
+
+      // Cast each batch to the unified schema
+      unifiedBatches = new ArrayList<>(batches.size());
+      List<VectorSchemaRoot> batchesToClose = new ArrayList<>();
+      try {
+        for (VectorSchemaRoot batch : batches) {
+          VectorSchemaRoot castedBatch = castBatchToSchema(batch, unifiedSchema);
+          if (castedBatch == null) {
+            // Casting failed - clean up and fall back to individual writes
+            LOG.warn("Failed to cast batch to unified schema - will write individually");
+            for (VectorSchemaRoot toClose : batchesToClose) {
+              try {
+                toClose.close();
+              } catch (Exception closeEx) {
+                LOG.warn("Failed to close casted batch during cleanup: {}", closeEx.getMessage());
+              }
+            }
+            return null;
+          }
+          unifiedBatches.add(castedBatch);
+          batchesToClose.add(castedBatch);
+        }
+      } catch (Exception e) {
+        // Clean up any casted batches on failure
+        for (VectorSchemaRoot toClose : batchesToClose) {
+          try {
+            toClose.close();
+          } catch (Exception closeEx) {
+            LOG.warn("Failed to close casted batch during cleanup: {}", closeEx.getMessage());
+          }
+        }
+        throw e;
+      }
+    }
+
+    // Handle single batch case
+    if (unifiedBatches.size() == 1) {
+      VectorSchemaRoot source = unifiedBatches.get(0);
+      if (schemasMatch) {
+        // Need to copy since original will be closed separately
+        VectorSchemaRoot copy = VectorSchemaRoot.create(unifiedSchema, allocator);
+        try {
+          copy.allocateNew();
+          for (int i = 0; i < source.getFieldVectors().size(); i++) {
+            FieldVector sourceVector = source.getFieldVectors().get(i);
+            FieldVector targetVector = copy.getFieldVectors().get(i);
+            for (int row = 0; row < source.getRowCount(); row++) {
+              targetVector.copyFromSafe(row, row, sourceVector);
+            }
+          }
+          copy.setRowCount(source.getRowCount());
+          return copy;
+        } catch (Exception e) {
+          try {
+            copy.close();
+          } catch (Exception closeEx) {
+            LOG.warn("Failed to close copy root during cleanup: {}", closeEx.getMessage());
+          }
+          throw e;
+        }
+      } else {
+        // Already casted - just return it (caller will close original)
+        return source;
+      }
+    }
 
     // Calculate total row count
-    int totalRows = batches.stream().mapToInt(VectorSchemaRoot::getRowCount).sum();
+    int totalRows = unifiedBatches.stream().mapToInt(VectorSchemaRoot::getRowCount).sum();
 
     // Create consolidated root
-    VectorSchemaRoot consolidated = VectorSchemaRoot.create(schema, allocator);
+    VectorSchemaRoot consolidated = VectorSchemaRoot.create(unifiedSchema, allocator);
     try {
       consolidated.allocateNew();
 
       // Copy data from each batch using VectorBatchAppender
-      VectorSchemaRoot[] batchArray = batches.toArray(new VectorSchemaRoot[0]);
+      VectorSchemaRoot[] batchArray = unifiedBatches.toArray(new VectorSchemaRoot[0]);
       for (int i = 0; i < consolidated.getFieldVectors().size(); i++) {
         FieldVector targetVector = consolidated.getFieldVectors().get(i);
         FieldVector[] sourceVectors = new FieldVector[batchArray.length];
@@ -756,14 +1033,38 @@ public class DucklakeSinkTask extends SinkTask {
 
       consolidated.setRowCount(totalRows);
       LOG.debug(
-          "Consolidated {} batches into single batch with {} rows", batches.size(), totalRows);
+          "Consolidated {} batches into single batch with {} rows",
+          unifiedBatches.size(),
+          totalRows);
+
+      // Close casted batches if we created them (not the originals)
+      if (!schemasMatch) {
+        for (VectorSchemaRoot castedBatch : unifiedBatches) {
+          try {
+            castedBatch.close();
+          } catch (Exception closeEx) {
+            LOG.warn("Failed to close casted batch: {}", closeEx.getMessage());
+          }
+        }
+      }
+
       return consolidated;
     } catch (Exception e) {
-      // Clean up on failure to prevent memory leak
+      // Clean up on failure
       try {
         consolidated.close();
       } catch (Exception closeEx) {
         LOG.warn("Failed to close consolidated root during cleanup: {}", closeEx.getMessage());
+      }
+      // Also clean up casted batches if we created them
+      if (!schemasMatch) {
+        for (VectorSchemaRoot castedBatch : unifiedBatches) {
+          try {
+            castedBatch.close();
+          } catch (Exception closeEx) {
+            LOG.warn("Failed to close casted batch during cleanup: {}", closeEx.getMessage());
+          }
+        }
       }
       throw e;
     }
