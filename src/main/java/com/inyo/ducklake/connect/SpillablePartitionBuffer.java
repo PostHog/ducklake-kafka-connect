@@ -15,6 +15,7 @@
  */
 package com.inyo.ducklake.connect;
 
+import edu.umd.cs.findbugs.annotations.SuppressFBWarnings;
 import java.io.IOException;
 import java.nio.file.Files;
 import java.nio.file.Path;
@@ -68,6 +69,9 @@ public class SpillablePartitionBuffer {
    *
    * @param spillDirectory the directory to write spill files to
    */
+  @SuppressFBWarnings(
+      value = "CT_CONSTRUCTOR_THROW",
+      justification = "Failing fast on invalid spill directory is intentional")
   public SpillablePartitionBuffer(Path spillDirectory) {
     this.spillDirectory = spillDirectory;
     try {

@@ -849,7 +849,9 @@ public class DucklakeSinkTask extends SinkTask {
       return;
     }
     Files.walk(directory)
-        .sorted((a, b) -> -a.compareTo(b)) // Reverse order so files are deleted before directories
+        .sorted(
+            java.util.Comparator
+                .reverseOrder()) // Reverse order so files are deleted before directories
         .forEach(
             path -> {
               try {
