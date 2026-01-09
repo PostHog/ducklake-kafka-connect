@@ -126,32 +126,47 @@ public class SpillablePartitionBuffer {
   }
 
   /**
-   * Reads all spilled batches back from disk.
+   * Reads all spilled batches back from disk. Missing files are skipped with a warning - this can
+   * happen after pod restarts or task rebalancing in Kubernetes where /tmp is ephemeral. Lost
+   * buffered data is acceptable since Kafka will resend from the last committed offset.
    *
    * @param allocator the Arrow allocator to use for reading
-   * @return list of VectorSchemaRoot batches read from disk
+   * @return list of VectorSchemaRoot batches successfully read from disk
    */
   public List<VectorSchemaRoot> readBatches(BufferAllocator allocator) {
     List<VectorSchemaRoot> batches = new ArrayList<>();
+    int skippedCount = 0;
 
     for (SpilledBatch spilled : spilledBatches) {
+      // Skip files that don't exist (e.g., after pod restart in K8s)
+      if (!Files.exists(spilled.filePath)) {
+        LOG.warn(
+            "Spill file does not exist (likely lost during pod restart/rebalance): {}",
+            spilled.filePath);
+        skippedCount++;
+        continue;
+      }
+
       try {
         VectorSchemaRoot root = readArrowFile(spilled.filePath, allocator);
         if (root != null) {
           batches.add(root);
         }
       } catch (IOException e) {
-        LOG.error("Failed to read spilled batch from {}", spilled.filePath, e);
-        // Close any batches we've already read
-        for (VectorSchemaRoot batch : batches) {
-          try {
-            batch.close();
-          } catch (Exception ignored) {
-            // Ignore cleanup errors
-          }
-        }
-        throw new RuntimeException("Failed to read spilled batch", e);
+        LOG.warn(
+            "Failed to read spilled batch from {} (skipping): {}",
+            spilled.filePath,
+            e.getMessage());
+        skippedCount++;
+        // Continue reading other batches instead of failing completely
       }
+    }
+
+    if (skippedCount > 0) {
+      LOG.warn(
+          "Skipped {} spill files that could not be read. "
+              + "This is expected after pod restart/rebalance - Kafka will resend the data.",
+          skippedCount);
     }
 
     return batches;
