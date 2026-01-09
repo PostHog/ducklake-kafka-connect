@@ -39,8 +39,11 @@ import org.apache.arrow.memory.BufferAllocator;
 import org.apache.arrow.memory.RootAllocator;
 import org.apache.arrow.vector.BigIntVector;
 import org.apache.arrow.vector.FieldVector;
+import org.apache.arrow.vector.Float4Vector;
 import org.apache.arrow.vector.Float8Vector;
 import org.apache.arrow.vector.IntVector;
+import org.apache.arrow.vector.SmallIntVector;
+import org.apache.arrow.vector.TinyIntVector;
 import org.apache.arrow.vector.VectorSchemaRoot;
 import org.apache.arrow.vector.types.pojo.ArrowType;
 import org.apache.arrow.vector.types.pojo.Field;
@@ -787,6 +790,32 @@ public class DucklakeSinkTask extends SinkTask {
     ArrowType sourceType = source.getField().getType();
     ArrowType targetType = target.getField().getType();
 
+    // TinyInt (Int8) to Int64 promotion
+    if (source instanceof TinyIntVector tinyIntSource
+        && target instanceof BigIntVector bigIntTarget) {
+      for (int row = 0; row < rowCount; row++) {
+        if (tinyIntSource.isNull(row)) {
+          bigIntTarget.setNull(row);
+        } else {
+          bigIntTarget.setSafe(row, tinyIntSource.get(row));
+        }
+      }
+      return true;
+    }
+
+    // SmallInt (Int16) to Int64 promotion
+    if (source instanceof SmallIntVector smallIntSource
+        && target instanceof BigIntVector bigIntTarget) {
+      for (int row = 0; row < rowCount; row++) {
+        if (smallIntSource.isNull(row)) {
+          bigIntTarget.setNull(row);
+        } else {
+          bigIntTarget.setSafe(row, smallIntSource.get(row));
+        }
+      }
+      return true;
+    }
+
     // Int32 to Int64 promotion
     if (source instanceof IntVector intSource && target instanceof BigIntVector bigIntTarget) {
       for (int row = 0; row < rowCount; row++) {
@@ -799,14 +828,40 @@ public class DucklakeSinkTask extends SinkTask {
       return true;
     }
 
-    // Float32 to Float64 promotion (via copyFromSafe which handles this)
-    if (source instanceof org.apache.arrow.vector.Float4Vector float4Source
+    // Float32 to Float64 promotion
+    if (source instanceof Float4Vector float4Source
         && target instanceof Float8Vector float8Target) {
       for (int row = 0; row < rowCount; row++) {
         if (float4Source.isNull(row)) {
           float8Target.setNull(row);
         } else {
           float8Target.setSafe(row, float4Source.get(row));
+        }
+      }
+      return true;
+    }
+
+    // TinyInt to Float64 promotion
+    if (source instanceof TinyIntVector tinyIntSource
+        && target instanceof Float8Vector float8Target) {
+      for (int row = 0; row < rowCount; row++) {
+        if (tinyIntSource.isNull(row)) {
+          float8Target.setNull(row);
+        } else {
+          float8Target.setSafe(row, tinyIntSource.get(row));
+        }
+      }
+      return true;
+    }
+
+    // SmallInt to Float64 promotion
+    if (source instanceof SmallIntVector smallIntSource
+        && target instanceof Float8Vector float8Target) {
+      for (int row = 0; row < rowCount; row++) {
+        if (smallIntSource.isNull(row)) {
+          float8Target.setNull(row);
+        } else {
+          float8Target.setSafe(row, smallIntSource.get(row));
         }
       }
       return true;
