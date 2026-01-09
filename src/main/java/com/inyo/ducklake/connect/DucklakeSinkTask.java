@@ -17,6 +17,9 @@ package com.inyo.ducklake.connect;
 
 import com.inyo.ducklake.ingestor.DucklakeWriter;
 import edu.umd.cs.findbugs.annotations.SuppressFBWarnings;
+import java.io.IOException;
+import java.nio.file.Files;
+import java.nio.file.Path;
 import java.sql.SQLException;
 import java.util.ArrayList;
 import java.util.Collection;
@@ -59,12 +62,17 @@ public class DucklakeSinkTask extends SinkTask {
 
   // Buffering state
   private Map<TopicPartition, PartitionBuffer> buffers;
+  private Map<TopicPartition, SpillablePartitionBuffer> spillableBuffers;
   private int flushSize;
   private long flushIntervalMs;
   private long fileSizeBytes;
   private ScheduledExecutorService flushScheduler;
   private ExecutorService partitionExecutor;
   private boolean parallelPartitionFlush;
+
+  // Spill configuration
+  private boolean spillEnabled;
+  private Path spillDirectory;
 
   // Per-partition locks for buffer operations (fast operations like adding records)
   private final ConcurrentHashMap<TopicPartition, ReentrantLock> partitionLocks =
@@ -147,6 +155,7 @@ public class DucklakeSinkTask extends SinkTask {
     this.connectionFactory = new DucklakeConnectionFactory(config);
     this.writers = new HashMap<>();
     this.buffers = new HashMap<>();
+    this.spillableBuffers = new HashMap<>();
     this.allocator = new RootAllocator();
     this.converter = new SinkRecordToArrowConverter(allocator);
 
@@ -156,15 +165,32 @@ public class DucklakeSinkTask extends SinkTask {
     this.fileSizeBytes = config.getFileSizeBytes();
     this.parallelPartitionFlush = config.isParallelPartitionFlushEnabled();
 
+    // Initialize spill configuration
+    this.spillEnabled = config.isSpillEnabled();
+    if (spillEnabled) {
+      String spillDir = config.getSpillDirectory();
+      if (spillDir == null || spillDir.isEmpty()) {
+        try {
+          this.spillDirectory = Files.createTempDirectory("ducklake-spill");
+        } catch (IOException e) {
+          throw new RuntimeException("Failed to create temp spill directory", e);
+        }
+      } else {
+        this.spillDirectory = Path.of(spillDir);
+      }
+      LOG.info("Spill enabled, using directory: {}", spillDirectory);
+    }
+
     int threadCount = config.getDuckDbThreads();
     LOG.info(
         "Buffering config: flushSize={}, flushIntervalMs={}, fileSizeBytes={}, "
-            + "parallelPartitionFlush={}, duckdbThreads={}",
+            + "parallelPartitionFlush={}, duckdbThreads={}, spillEnabled={}",
         flushSize,
         flushIntervalMs,
         fileSizeBytes,
         parallelPartitionFlush,
-        threadCount);
+        threadCount,
+        spillEnabled);
 
     // Create executor for parallel partition processing
     if (parallelPartitionFlush) {
@@ -227,6 +253,91 @@ public class DucklakeSinkTask extends SinkTask {
   private void checkTimeBasedFlush() {
     long now = System.currentTimeMillis();
 
+    if (spillEnabled) {
+      checkTimeBasedFlushSpillable(now);
+    } else {
+      checkTimeBasedFlushInMemory(now);
+    }
+  }
+
+  /** Time-based flush check for spillable buffers */
+  private void checkTimeBasedFlushSpillable(long now) {
+    for (Map.Entry<TopicPartition, SpillablePartitionBuffer> entry : spillableBuffers.entrySet()) {
+      TopicPartition partition = entry.getKey();
+      SpillablePartitionBuffer buffer = entry.getValue();
+
+      // Get or assign jitter for this partition
+      long jitter = getPartitionJitter(partition);
+      long effectiveFlushInterval = flushIntervalMs + jitter;
+
+      // Skip if buffer is empty or not due for flush
+      if (buffer.isEmpty() || (now - buffer.getLastFlushTime()) < effectiveFlushInterval) {
+        continue;
+      }
+
+      // Try to acquire per-partition lock
+      ReentrantLock lock = partitionLocks.computeIfAbsent(partition, k -> new ReentrantLock());
+      boolean lockAcquired = false;
+      try {
+        lockAcquired = lock.tryLock(FLUSH_LOCK_TIMEOUT_MS, TimeUnit.MILLISECONDS);
+      } catch (InterruptedException e) {
+        Thread.currentThread().interrupt();
+        return;
+      }
+
+      if (!lockAcquired) {
+        AtomicInteger skips =
+            consecutiveFlushSkips.computeIfAbsent(partition, k -> new AtomicInteger(0));
+        int skipCount = skips.incrementAndGet();
+        if (skipCount >= MAX_CONSECUTIVE_SKIPS_BEFORE_WARNING) {
+          LOG.warn(
+              "Flush check for partition {} skipped {} times - possible lock contention",
+              partition,
+              skipCount);
+        }
+        continue;
+      }
+
+      try {
+        consecutiveFlushSkips.computeIfAbsent(partition, k -> new AtomicInteger(0)).set(0);
+
+        // Re-check condition under lock
+        if (!buffer.isEmpty() && (now - buffer.getLastFlushTime()) >= effectiveFlushInterval) {
+          LOG.info(
+              "Time-based flush triggered for partition {} (age={}ms, jitter={}ms, records={}, bytes={})",
+              partition,
+              now - buffer.getLastFlushTime(),
+              jitter,
+              buffer.getRecordCount(),
+              buffer.getEstimatedBytes());
+
+          // Read batches from disk and flush
+          List<VectorSchemaRoot> batches = buffer.readBatches(allocator);
+          FlushData flushData =
+              new FlushData(batches, buffer.getRecordCount(), buffer.getEstimatedBytes());
+          buffer.clear();
+
+          // Release lock before slow I/O
+          lock.unlock();
+          lockAcquired = false;
+
+          try {
+            flushBatches(partition, flushData);
+          } catch (Exception e) {
+            LOG.warn(
+                "Error during time-based flush for partition {}: {}", partition, e.getMessage());
+          }
+        }
+      } finally {
+        if (lockAcquired) {
+          lock.unlock();
+        }
+      }
+    }
+  }
+
+  /** Time-based flush check for in-memory buffers */
+  private void checkTimeBasedFlushInMemory(long now) {
     for (Map.Entry<TopicPartition, PartitionBuffer> entry : buffers.entrySet()) {
       TopicPartition partition = entry.getKey();
       PartitionBuffer buffer = entry.getValue();
@@ -312,8 +423,16 @@ public class DucklakeSinkTask extends SinkTask {
       for (TopicPartition partition : partitions) {
         DucklakeWriter writer = writerFactory.create(partition.topic());
         writers.put(partition, writer);
-        buffers.put(partition, new PartitionBuffer());
-        LOG.info("Created writer and buffer for partition: {}", partition);
+        if (spillEnabled) {
+          // Create spillable buffer with partition-specific subdirectory
+          Path partitionSpillDir =
+              spillDirectory.resolve(partition.topic() + "-" + partition.partition());
+          spillableBuffers.put(partition, new SpillablePartitionBuffer(partitionSpillDir));
+          LOG.info("Created writer and spillable buffer for partition: {}", partition);
+        } else {
+          buffers.put(partition, new PartitionBuffer());
+          LOG.info("Created writer and in-memory buffer for partition: {}", partition);
+        }
       }
     } catch (SQLException e) {
       throw new RuntimeException("Failed to create writers for partitions", e);
@@ -383,6 +502,102 @@ public class DucklakeSinkTask extends SinkTask {
 
   /** Process a single partition with proper locking. */
   private void processPartition(TopicPartition partition, List<SinkRecord> partitionRecords) {
+    if (spillEnabled) {
+      processPartitionSpillable(partition, partitionRecords);
+    } else {
+      processPartitionInMemory(partition, partitionRecords);
+    }
+  }
+
+  /** Process a single partition using spillable buffer. */
+  private void processPartitionSpillable(
+      TopicPartition partition, List<SinkRecord> partitionRecords) {
+    ReentrantLock lock = partitionLocks.computeIfAbsent(partition, k -> new ReentrantLock());
+    SpillablePartitionBuffer buffer = spillableBuffers.get(partition);
+
+    if (buffer == null) {
+      LOG.warn("No spillable buffer found for partition: {}", partition);
+      return;
+    }
+
+    FlushData flushData = null;
+    lock.lock();
+    try {
+      // Convert records to Arrow and spill to disk
+      boolean hasArrowIpcData =
+          partitionRecords.stream().anyMatch(record -> record.value() instanceof VectorSchemaRoot);
+
+      if (hasArrowIpcData) {
+        // Arrow IPC data - spill each VectorSchemaRoot directly
+        for (SinkRecord record : partitionRecords) {
+          if (record.value() instanceof VectorSchemaRoot root) {
+            buffer.add(root);
+          }
+        }
+      } else {
+        // Traditional data - convert to Arrow first, then spill
+        Map<TopicPartition, List<SinkRecord>> singlePartitionMap = new HashMap<>();
+        singlePartitionMap.put(partition, partitionRecords);
+
+        try {
+          Map<TopicPartition, VectorSchemaRoot> vectorsByPartition =
+              converter.convertRecordsByPartition(singlePartitionMap);
+          VectorSchemaRoot root = vectorsByPartition.get(partition);
+          if (root != null) {
+            buffer.add(root); // This spills to disk and closes the root
+          }
+        } catch (RuntimeException e) {
+          if (isSchemaConflictError(e)) {
+            LOG.warn(
+                "Schema conflict in spillable mode for partition {}: {}",
+                partition,
+                e.getMessage());
+            // In spillable mode, we can't easily do per-record DLQ handling
+            // because we need to write to disk. For now, just throw.
+            throw e;
+          }
+          throw e;
+        }
+      }
+
+      // Check if flush needed
+      if (buffer.shouldFlush(flushSize, fileSizeBytes, flushIntervalMs)) {
+        String reason;
+        if (buffer.getRecordCount() >= flushSize) {
+          reason = "record count";
+        } else if (buffer.getEstimatedBytes() >= fileSizeBytes) {
+          reason = "file size";
+        } else {
+          reason = "time interval";
+        }
+        LOG.info(
+            "Flush triggered for partition {} (reason={}, records={}, bytes={})",
+            partition,
+            reason,
+            buffer.getRecordCount(),
+            buffer.getEstimatedBytes());
+
+        // Read batches back from disk
+        List<VectorSchemaRoot> batches = buffer.readBatches(allocator);
+        flushData = new FlushData(batches, buffer.getRecordCount(), buffer.getEstimatedBytes());
+        buffer.clear();
+      }
+    } catch (Exception e) {
+      LOG.error("Error processing records for partition {}", partition, e);
+      throw new RuntimeException("Failed to process sink records", e);
+    } finally {
+      lock.unlock();
+    }
+
+    // Phase 2: Perform slow I/O flush OUTSIDE the lock
+    if (flushData != null) {
+      flushBatches(partition, flushData);
+    }
+  }
+
+  /** Process a single partition using in-memory buffer. */
+  private void processPartitionInMemory(
+      TopicPartition partition, List<SinkRecord> partitionRecords) {
     ReentrantLock lock = partitionLocks.computeIfAbsent(partition, k -> new ReentrantLock());
 
     // Phase 1: Buffer records and check if flush needed (under lock)
@@ -602,6 +817,47 @@ public class DucklakeSinkTask extends SinkTask {
     // Extract flush data and perform flush
     FlushData flushData = extractFlushDataFromBuffer(buffer);
     flushBatches(partition, flushData);
+  }
+
+  /**
+   * Flush all spillable buffered data for a partition. This method is used during stop() where the
+   * lock is already held. It reads batches from disk and performs the flush synchronously.
+   */
+  private void flushSpillablePartition(TopicPartition partition) {
+    SpillablePartitionBuffer buffer = spillableBuffers.get(partition);
+    if (buffer == null || buffer.isEmpty()) {
+      return;
+    }
+
+    LOG.info(
+        "Flushing spillable partition {} during stop: {} batches, {} records",
+        partition,
+        buffer.getBatchCount(),
+        buffer.getRecordCount());
+
+    // Read batches from disk and flush
+    List<VectorSchemaRoot> batches = buffer.readBatches(allocator);
+    FlushData flushData =
+        new FlushData(batches, buffer.getRecordCount(), buffer.getEstimatedBytes());
+    buffer.clear();
+    flushBatches(partition, flushData);
+  }
+
+  /** Recursively delete a directory and all its contents. */
+  private void deleteDirectoryRecursively(Path directory) throws IOException {
+    if (directory == null || !Files.exists(directory)) {
+      return;
+    }
+    Files.walk(directory)
+        .sorted((a, b) -> -a.compareTo(b)) // Reverse order so files are deleted before directories
+        .forEach(
+            path -> {
+              try {
+                Files.deleteIfExists(path);
+              } catch (IOException e) {
+                LOG.warn("Failed to delete {}: {}", path, e.getMessage());
+              }
+            });
   }
 
   /**
@@ -986,22 +1242,53 @@ public class DucklakeSinkTask extends SinkTask {
     }
 
     // Flush all remaining buffered data (acquire each partition lock)
-    for (TopicPartition partition : buffers.keySet()) {
-      ReentrantLock lock = partitionLocks.get(partition);
-      if (lock != null) {
-        lock.lock();
-      }
-      try {
-        flushPartition(partition);
-      } catch (Exception e) {
-        LOG.warn("Failed to flush partition {} during stop: {}", partition, e.getMessage());
-      } finally {
+    if (spillEnabled) {
+      // Flush spillable buffers
+      for (TopicPartition partition : spillableBuffers.keySet()) {
+        ReentrantLock lock = partitionLocks.get(partition);
         if (lock != null) {
-          lock.unlock();
+          lock.lock();
+        }
+        try {
+          flushSpillablePartition(partition);
+        } catch (Exception e) {
+          LOG.warn(
+              "Failed to flush spillable partition {} during stop: {}", partition, e.getMessage());
+        } finally {
+          if (lock != null) {
+            lock.unlock();
+          }
         }
       }
+      spillableBuffers.clear();
+      // Clean up spill directory
+      if (spillDirectory != null) {
+        try {
+          deleteDirectoryRecursively(spillDirectory);
+          LOG.info("Cleaned up spill directory: {}", spillDirectory);
+        } catch (Exception e) {
+          LOG.warn("Failed to clean up spill directory {}: {}", spillDirectory, e.getMessage());
+        }
+      }
+    } else {
+      // Flush in-memory buffers
+      for (TopicPartition partition : buffers.keySet()) {
+        ReentrantLock lock = partitionLocks.get(partition);
+        if (lock != null) {
+          lock.lock();
+        }
+        try {
+          flushPartition(partition);
+        } catch (Exception e) {
+          LOG.warn("Failed to flush partition {} during stop: {}", partition, e.getMessage());
+        } finally {
+          if (lock != null) {
+            lock.unlock();
+          }
+        }
+      }
+      buffers.clear();
     }
-    buffers.clear();
     partitionLocks.clear();
     flushLocks.clear();
     consecutiveFlushSkips.clear();

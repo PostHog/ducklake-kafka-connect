@@ -61,6 +61,10 @@ public class DucklakeSinkConfig extends AbstractConfig {
   // DuckLake retry configuration for handling PostgreSQL serialization conflicts
   public static final String DUCKLAKE_MAX_RETRY_COUNT = "ducklake.max_retry_count";
 
+  // Disk spill configuration for reducing memory pressure
+  public static final String SPILL_ENABLED = "spill.enabled";
+  public static final String SPILL_DIRECTORY = "spill.directory";
+
   // Table-specific configuration property patterns
   static final String TABLE_ID_COLUMNS_PATTERN = "ducklake.table.%s.id-columns";
   static final String TABLE_PARTITION_BY_PATTERN = "ducklake.table.%s.partition-by";
@@ -162,7 +166,21 @@ public class DucklakeSinkConfig extends AbstractConfig {
             10,
             ConfigDef.Importance.MEDIUM,
             "Maximum number of retries for DuckLake transactions when PostgreSQL serialization "
-                + "conflicts occur. Increase for high-concurrency deployments. Default: 10");
+                + "conflicts occur. Increase for high-concurrency deployments. Default: 10")
+        .define(
+            SPILL_ENABLED,
+            ConfigDef.Type.BOOLEAN,
+            false,
+            ConfigDef.Importance.MEDIUM,
+            "Enable spilling Arrow batches to disk instead of holding in memory. "
+                + "Reduces memory pressure for large buffer sizes. Default: false")
+        .define(
+            SPILL_DIRECTORY,
+            ConfigDef.Type.STRING,
+            "",
+            ConfigDef.Importance.LOW,
+            "Directory for spill files when spill.enabled=true. "
+                + "Default: empty (uses system temp directory)");
   }
 
   public DucklakeSinkConfig(ConfigDef definition, Map<?, ?> originals) {
@@ -258,6 +276,24 @@ public class DucklakeSinkConfig extends AbstractConfig {
    */
   public int getDucklakeMaxRetryCount() {
     return getInt(DUCKLAKE_MAX_RETRY_COUNT);
+  }
+
+  /**
+   * Returns whether disk spilling is enabled for Arrow batches.
+   *
+   * @return true if spill is enabled, default false
+   */
+  public boolean isSpillEnabled() {
+    return getBoolean(SPILL_ENABLED);
+  }
+
+  /**
+   * Returns the directory for spill files.
+   *
+   * @return spill directory path, or empty string to use system temp directory
+   */
+  public String getSpillDirectory() {
+    return getString(SPILL_DIRECTORY);
   }
 
   /**
