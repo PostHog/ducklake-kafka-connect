@@ -242,6 +242,13 @@ public class SpillablePartitionBuffer {
 
   /** Writes a VectorSchemaRoot to an Arrow IPC file. */
   private void writeArrowFile(VectorSchemaRoot root, Path path) throws IOException {
+    // Ensure parent directory exists - it might have been deleted by another task's stop()
+    // during rebalancing (race condition between old task cleanup and new task writes)
+    Path parent = path.getParent();
+    if (parent != null) {
+      Files.createDirectories(parent);
+    }
+
     try (var channel =
             Files.newByteChannel(
                 path,
