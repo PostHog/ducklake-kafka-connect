@@ -20,6 +20,7 @@ import static org.junit.jupiter.api.Assertions.assertFalse;
 import static org.junit.jupiter.api.Assertions.assertTrue;
 
 import java.io.IOException;
+import java.nio.charset.StandardCharsets;
 import java.nio.file.Files;
 import java.nio.file.Path;
 import java.util.List;
@@ -98,7 +99,7 @@ class SpillablePartitionBufferTest {
 
     for (int i = 0; i < 10; i++) {
       assertEquals(i, idVector.get(i));
-      assertEquals("name-" + i, new String(nameVector.get(i)));
+      assertEquals("name-" + i, new String(nameVector.get(i), StandardCharsets.UTF_8));
     }
 
     // Clean up
@@ -228,7 +229,7 @@ class SpillablePartitionBufferTest {
 
     for (int i = 0; i < rowCount; i++) {
       idVector.setSafe(i, i);
-      nameVector.setSafe(i, ("name-" + i).getBytes());
+      nameVector.setSafe(i, ("name-" + i).getBytes(StandardCharsets.UTF_8));
     }
 
     root.setRowCount(rowCount);
