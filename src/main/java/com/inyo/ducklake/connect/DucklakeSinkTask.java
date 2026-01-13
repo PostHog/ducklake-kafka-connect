@@ -38,6 +38,7 @@ import java.util.concurrent.TimeUnit;
 import java.util.concurrent.atomic.AtomicInteger;
 import java.util.concurrent.locks.ReentrantLock;
 import java.util.stream.Collectors;
+import java.util.stream.Stream;
 import org.apache.arrow.memory.BufferAllocator;
 import org.apache.arrow.memory.RootAllocator;
 import org.apache.arrow.vector.BigIntVector;
@@ -179,13 +180,23 @@ public class DucklakeSinkTask extends SinkTask {
     if (spillEnabled) {
       String spillDir = config.getSpillDirectory();
       if (spillDir == null || spillDir.isEmpty()) {
-        try {
-          this.spillDirectory = Files.createTempDirectory("ducklake-spill");
-        } catch (IOException e) {
-          throw new RuntimeException("Failed to create temp spill directory", e);
-        }
+        // Use a fixed directory path in system temp instead of creating new temp dirs each time.
+        // This prevents orphaned directories from accumulating across task restarts.
+        Path tempDir = Path.of(System.getProperty("java.io.tmpdir"));
+        this.spillDirectory = tempDir.resolve("ducklake-spill");
+
+        // Clean up any orphaned ducklake-spill-* directories from previous task instances
+        // that used Files.createTempDirectory() (old behavior)
+        cleanupOrphanedSpillDirectories(tempDir);
       } else {
         this.spillDirectory = Path.of(spillDir);
+      }
+
+      // Ensure the spill directory exists
+      try {
+        Files.createDirectories(spillDirectory);
+      } catch (IOException e) {
+        throw new RuntimeException("Failed to create spill directory: " + spillDirectory, e);
       }
       LOG.info("Spill enabled, using directory: {}", spillDirectory);
     }
@@ -436,6 +447,22 @@ public class DucklakeSinkTask extends SinkTask {
           // Create spillable buffer with partition-specific subdirectory
           Path partitionSpillDir =
               spillDirectory.resolve(partition.topic() + "-" + partition.partition());
+
+          // Clean up any orphaned spill files from a previous task instance that may have
+          // crashed or been terminated without proper cleanup during rebalancing
+          if (Files.exists(partitionSpillDir)) {
+            LOG.info(
+                "Cleaning up existing partition spill directory before use: {}", partitionSpillDir);
+            try {
+              deleteDirectoryRecursively(partitionSpillDir);
+            } catch (IOException e) {
+              LOG.warn(
+                  "Failed to clean up partition spill directory {}: {}",
+                  partitionSpillDir,
+                  e.getMessage());
+            }
+          }
+
           spillableBuffers.put(partition, new SpillablePartitionBuffer(partitionSpillDir));
           LOG.info("Created writer and spillable buffer for partition: {}", partition);
         } else {
@@ -850,6 +877,43 @@ public class DucklakeSinkTask extends SinkTask {
         new FlushData(batches, buffer.getRecordCount(), buffer.getEstimatedBytes());
     buffer.clear();
     flushBatches(partition, flushData);
+  }
+
+  /**
+   * Cleans up orphaned ducklake-spill-* directories in the temp directory. These directories may
+   * have been left behind by previous task instances that crashed or were terminated without proper
+   * cleanup. Only cleans up directories matching the old temp directory naming pattern
+   * (ducklake-spill*).
+   *
+   * <p>Package-private for testing.
+   */
+  void cleanupOrphanedSpillDirectories(Path tempDir) {
+    try (Stream<Path> paths = Files.list(tempDir)) {
+      paths
+          .filter(Files::isDirectory)
+          .filter(
+              p -> {
+                String name = p.getFileName().toString();
+                // Match old-style temp directories: ducklake-spill followed by random suffix
+                // e.g., ducklake-spill1234567890
+                // But NOT our new fixed directory name "ducklake-spill" (exact match)
+                return name.startsWith("ducklake-spill") && !name.equals("ducklake-spill");
+              })
+          .forEach(
+              orphanedDir -> {
+                LOG.info("Cleaning up orphaned spill directory: {}", orphanedDir);
+                try {
+                  deleteDirectoryRecursively(orphanedDir);
+                } catch (IOException e) {
+                  LOG.warn(
+                      "Failed to clean up orphaned spill directory {}: {}",
+                      orphanedDir,
+                      e.getMessage());
+                }
+              });
+    } catch (IOException e) {
+      LOG.warn("Failed to scan for orphaned spill directories in {}: {}", tempDir, e.getMessage());
+    }
   }
 
   /** Recursively delete a directory and all its contents. */
