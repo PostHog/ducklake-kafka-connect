@@ -21,7 +21,6 @@ import edu.umd.cs.findbugs.annotations.SuppressFBWarnings;
 import java.io.IOException;
 import java.nio.file.Files;
 import java.nio.file.Path;
-import java.util.stream.Stream;
 import java.sql.SQLException;
 import java.util.ArrayList;
 import java.util.Collection;
@@ -39,6 +38,7 @@ import java.util.concurrent.TimeUnit;
 import java.util.concurrent.atomic.AtomicInteger;
 import java.util.concurrent.locks.ReentrantLock;
 import java.util.stream.Collectors;
+import java.util.stream.Stream;
 import org.apache.arrow.memory.BufferAllocator;
 import org.apache.arrow.memory.RootAllocator;
 import org.apache.arrow.vector.BigIntVector;
@@ -884,8 +884,10 @@ public class DucklakeSinkTask extends SinkTask {
    * have been left behind by previous task instances that crashed or were terminated without proper
    * cleanup. Only cleans up directories matching the old temp directory naming pattern
    * (ducklake-spill*).
+   *
+   * <p>Package-private for testing.
    */
-  private void cleanupOrphanedSpillDirectories(Path tempDir) {
+  void cleanupOrphanedSpillDirectories(Path tempDir) {
     try (Stream<Path> paths = Files.list(tempDir)) {
       paths
           .filter(Files::isDirectory)
