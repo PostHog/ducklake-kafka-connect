@@ -93,8 +93,23 @@ public final class DucklakeTableManager {
     Boolean cachedExists = VERIFIED_TABLES.get(tableKey);
     if (cachedExists != null && cachedExists) {
       // Table exists and was verified before - only check for new columns
-      evolveTableSchemaIfNeeded(arrowSchema);
-      return true;
+      try {
+        evolveTableSchemaIfNeeded(arrowSchema);
+        return true;
+      } catch (SQLException e) {
+        // Cache may be stale - table doesn't actually exist (e.g., dropped externally)
+        // Invalidate cache and fall through to slow path for full verification
+        if (e.getMessage() != null && e.getMessage().contains("does not exist")) {
+          LOG.warn(
+              "Cached table {} doesn't exist (stale cache), falling through to full verification: {}",
+              table,
+              e.getMessage());
+          VERIFIED_TABLES.remove(tableKey);
+          KNOWN_COLUMNS.remove(tableKey);
+        } else {
+          throw e;
+        }
+      }
     }
 
     // Slow path: first time seeing this table, need full verification
