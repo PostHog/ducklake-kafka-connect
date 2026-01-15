@@ -308,6 +308,36 @@ class DucklakeTableManagerTest {
     assertTrue(ex.getMessage().contains("Incompatible type"));
   }
 
+  @Test
+  @DisplayName("Recovers gracefully when cached table is dropped externally")
+  void testStaleCacheRecovery() throws Exception {
+    String tableName = uniqueTableName("t_stale_cache");
+    DucklakeWriterConfig cfg =
+        new DucklakeWriterConfig(tableName, true, new String[] {}, new String[0]);
+    DucklakeTableManager mgr = new DucklakeTableManager(conn, cfg);
+
+    // Create table via ensureTable - this caches the table as verified
+    Schema s = schema(intField("id", 32), stringField("name"));
+    mgr.ensureTable(s);
+    assertTrue(mgr.tableExists(tableName), "Table should exist after creation");
+
+    // Drop the table directly via SQL (simulating external deletion or metadata reset)
+    try (var st = conn.createStatement()) {
+      st.execute("DROP TABLE lake.main." + SqlIdentifierUtil.quote(tableName));
+    }
+
+    // Verify table is actually gone
+    assertTrue(!mgr.tableExists(tableName), "Table should not exist after DROP");
+
+    // Call ensureTable again - should recover by invalidating cache and recreating
+    // Before the fix, this would throw: "Catalog Error: Table with name X does not exist!"
+    mgr.ensureTable(s);
+
+    // Verify table was recreated
+    assertTrue(mgr.tableExists(tableName), "Table should exist after recovery");
+    assertEquals(Set.of("id", "name"), getColumns(tableName));
+  }
+
   private Set<String> getColumns(String table) throws Exception {
     Set<String> set = new LinkedHashSet<>();
     try (PreparedStatement ps = conn.prepareStatement("SELECT name FROM pragma_table_info(?)")) {
