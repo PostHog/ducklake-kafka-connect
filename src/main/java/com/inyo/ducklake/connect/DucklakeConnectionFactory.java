@@ -37,22 +37,44 @@ public class DucklakeConnectionFactory {
     if (this.conn != null) {
       return;
     }
+    // Create connection with only non-extension-dependent properties.
+    // S3 settings require the httpfs extension, so they must be set via SQL
+    // after the connection is established and the extension is loaded.
     final Properties properties = new Properties();
-    properties.setProperty("s3_url_style", config.getS3UrlStyle());
-    properties.setProperty("s3_use_ssl", config.getS3UseSsl());
-    properties.setProperty("s3_endpoint", config.getS3Endpoint());
-    properties.setProperty("s3_access_key_id", config.getS3AccessKeyId());
-    properties.setProperty("s3_secret_access_key", config.getS3SecretAccessKey());
     int threadCount = config.getDuckDbThreads();
     properties.setProperty("threads", String.valueOf(threadCount));
     this.conn = (DuckDBConnection) DriverManager.getConnection("jdbc:duckdb:", properties);
-    final String statement = buildAttachStatement();
+
     try (var st = conn.createStatement()) {
+      // Only install/load httpfs and configure S3 when using S3 storage.
+      // This avoids the "httpfs extension needs to be loaded" error that occurs
+      // when S3 settings are passed as connection properties before the extension
+      // can be autoloaded, while still allowing local file storage to work without
+      // the httpfs extension.
+      if (requiresS3Configuration()) {
+        st.execute("INSTALL httpfs");
+        st.execute("LOAD httpfs");
+        st.execute("SET s3_url_style = '" + config.getS3UrlStyle() + "'");
+        st.execute("SET s3_use_ssl = " + config.getS3UseSsl());
+        st.execute("SET s3_endpoint = '" + config.getS3Endpoint() + "'");
+        st.execute("SET s3_access_key_id = '" + config.getS3AccessKeyId() + "'");
+        st.execute("SET s3_secret_access_key = '" + config.getS3SecretAccessKey() + "'");
+      }
+
+      // Attach the DuckLake catalog
+      final String statement = buildAttachStatement();
       st.execute(statement);
+
       // Configure DuckLake retry count for handling PostgreSQL serialization conflicts
       int maxRetryCount = config.getDucklakeMaxRetryCount();
       st.execute("SET ducklake_max_retry_count = " + maxRetryCount);
     }
+  }
+
+  /** Returns true if the data path uses S3 storage and requires httpfs configuration. */
+  private boolean requiresS3Configuration() {
+    String dataPath = config.getDataPath();
+    return dataPath != null && (dataPath.startsWith("s3://") || dataPath.startsWith("s3a://"));
   }
 
   /* package */ String buildAttachStatement() {
