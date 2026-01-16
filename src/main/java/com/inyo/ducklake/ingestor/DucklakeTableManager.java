@@ -327,7 +327,7 @@ public final class DucklakeTableManager {
             + newType;
     LOG.info("Upgrading column type: {}", ddl);
     try (Statement st = connection.createStatement()) {
-      st.execute(ddl);
+      st.execute(ddl); // nosemgrep: formatted-sql-string - DDL cannot use prepared statements
     }
   }
 
