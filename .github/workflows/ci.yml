@@ -370,7 +370,7 @@ jobs:
         run: |
           curl -X POST \
             -H "Accept: application/vnd.github+json" \
-            -H "Authorization: token ${{ secrets.CLOUD_INFRA_DISPATCH_TOKEN }}" \
+            -H "Authorization: token ${{ secrets.POSTHOG_BOT_PRIVATE_PAT }}" \
             https://api.github.com/repos/PostHog/posthog-cloud-infra/dispatches \
             -d '{"event_type":"ducklake-release","client_payload":{"version":"${{ steps.version.outputs.version }}"}}'
         continue-on-error: true
