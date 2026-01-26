@@ -223,7 +223,8 @@ class DucklakeWriterMergeTest {
   @Test
   @DisplayName("_inserted_at column is populated on simple insert")
   void testInsertedAtPopulatedOnInsert() throws Exception {
-    String tableName = "t_inserted_at_insert_" + java.util.UUID.randomUUID().toString().replace("-", "_");
+    String tableName =
+        "t_inserted_at_insert_" + java.util.UUID.randomUUID().toString().replace("-", "_");
     DucklakeWriterConfig cfg =
         new DucklakeWriterConfig(tableName, true, new String[] {}, new String[] {});
     try (DucklakeWriter writer = new DucklakeWriter(conn, cfg)) {
@@ -258,8 +259,7 @@ class DucklakeWriterMergeTest {
     String tableName =
         "t_inserted_at_merge_insert_" + java.util.UUID.randomUUID().toString().replace("-", "_");
     DucklakeWriterConfig cfg =
-        new DucklakeWriterConfig(
-            tableName, true, new String[] {"id"}, new String[] {"created_at"});
+        new DucklakeWriterConfig(tableName, true, new String[] {"id"}, new String[] {"created_at"});
     try (DucklakeWriter writer = new DucklakeWriter(conn, cfg)) {
       // First write creates the table (uses simple INSERT for new tables)
       try (VectorSchemaRoot r1 = root(new int[] {1}, new String[] {"alice"})) {
@@ -290,10 +290,10 @@ class DucklakeWriterMergeTest {
   @Test
   @DisplayName("_inserted_at column is NOT updated on MERGE update")
   void testInsertedAtNotUpdatedOnMerge() throws Exception {
-    String tableName = "t_inserted_at_merge_" + java.util.UUID.randomUUID().toString().replace("-", "_");
+    String tableName =
+        "t_inserted_at_merge_" + java.util.UUID.randomUUID().toString().replace("-", "_");
     DucklakeWriterConfig cfg =
-        new DucklakeWriterConfig(
-            tableName, true, new String[] {"id"}, new String[] {"created_at"});
+        new DucklakeWriterConfig(tableName, true, new String[] {"id"}, new String[] {"created_at"});
     try (DucklakeWriter writer = new DucklakeWriter(conn, cfg)) {
       // Initial insert
       try (VectorSchemaRoot r1 = root(new int[] {1}, new String[] {"alice"})) {
