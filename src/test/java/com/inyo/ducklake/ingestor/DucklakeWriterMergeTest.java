@@ -253,6 +253,41 @@ class DucklakeWriterMergeTest {
   }
 
   @Test
+  @DisplayName("_inserted_at column is populated on MERGE insert (WHEN NOT MATCHED)")
+  void testInsertedAtPopulatedOnMergeInsert() throws Exception {
+    String tableName =
+        "t_inserted_at_merge_insert_" + java.util.UUID.randomUUID().toString().replace("-", "_");
+    DucklakeWriterConfig cfg =
+        new DucklakeWriterConfig(
+            tableName, true, new String[] {"id"}, new String[] {"created_at"});
+    try (DucklakeWriter writer = new DucklakeWriter(conn, cfg)) {
+      // First write creates the table (uses simple INSERT for new tables)
+      try (VectorSchemaRoot r1 = root(new int[] {1}, new String[] {"alice"})) {
+        writer.write(r1);
+      }
+
+      // Second write uses MERGE since table exists; id=2 will go through WHEN NOT MATCHED
+      try (VectorSchemaRoot r2 = root(new int[] {2}, new String[] {"bob"})) {
+        writer.write(r2);
+      }
+
+      // Verify _inserted_at is populated for the MERGE-inserted row
+      try (var ps =
+          conn.prepareStatement(
+              "SELECT "
+                  + SqlIdentifierUtil.quote(DucklakeTableManager.INSERTED_AT_COLUMN)
+                  + " FROM lake.main."
+                  + SqlIdentifierUtil.quote(tableName)
+                  + " WHERE id = 2")) {
+        try (var rs = ps.executeQuery()) {
+          assertTrue(rs.next(), "Should have row inserted via MERGE");
+          assertNotNull(rs.getTimestamp(1), "_inserted_at should be set for MERGE-inserted row");
+        }
+      }
+    }
+  }
+
+  @Test
   @DisplayName("_inserted_at column is NOT updated on MERGE update")
   void testInsertedAtNotUpdatedOnMerge() throws Exception {
     String tableName = "t_inserted_at_merge_" + java.util.UUID.randomUUID().toString().replace("-", "_");

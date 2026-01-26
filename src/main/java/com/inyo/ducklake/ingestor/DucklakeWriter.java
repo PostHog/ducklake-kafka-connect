@@ -129,21 +129,17 @@ public final class DucklakeWriter implements AutoCloseable {
                   .collect(Collectors.joining(", "));
       // Filter out system columns from INSERT columns (we'll add them explicitly with NOW())
       var dataFields = fields.stream().filter(f -> !isSystemColumn(f.getName())).toList();
-      var insertCols =
-          dataFields.stream()
-              .map(f -> tempTable + "." + SqlIdentifierUtil.quote(f.getName()))
-              .collect(Collectors.joining(", "));
-      // Add NOW() for _inserted_at column
-      insertCols = insertCols + ", NOW()";
-      var targetCols =
-          dataFields.stream()
-              .map(f -> SqlIdentifierUtil.quote(f.getName()))
-              .collect(Collectors.joining(", "));
-      // Add _inserted_at to target columns
-      targetCols =
-          targetCols
-              + ", "
-              + SqlIdentifierUtil.quote(DucklakeTableManager.INSERTED_AT_COLUMN);
+      var insertColsList = new java.util.ArrayList<String>();
+      var targetColsList = new java.util.ArrayList<String>();
+      for (var f : dataFields) {
+        insertColsList.add(tempTable + "." + SqlIdentifierUtil.quote(f.getName()));
+        targetColsList.add(SqlIdentifierUtil.quote(f.getName()));
+      }
+      // Add _inserted_at with NOW() value
+      insertColsList.add("NOW()");
+      targetColsList.add(SqlIdentifierUtil.quote(DucklakeTableManager.INSERTED_AT_COLUMN));
+      var insertCols = String.join(", ", insertColsList);
+      var targetCols = String.join(", ", targetColsList);
       var sql = new StringBuilder();
       sql.append("MERGE INTO ")
           .append(tableQuoted)
@@ -192,19 +188,17 @@ public final class DucklakeWriter implements AutoCloseable {
       // Build simple INSERT INTO ... SELECT FROM tempTable
       // Filter out system columns (we'll add _inserted_at explicitly with NOW())
       var dataFields = fields.stream().filter(f -> !isSystemColumn(f.getName())).toList();
-      var columnNames =
-          dataFields.stream()
-              .map(f -> SqlIdentifierUtil.quote(f.getName()))
-              .collect(java.util.stream.Collectors.joining(", "));
-      // Add _inserted_at to target columns
-      columnNames =
-          columnNames + ", " + SqlIdentifierUtil.quote(DucklakeTableManager.INSERTED_AT_COLUMN);
-      var selectColumns =
-          dataFields.stream()
-              .map(f -> tempTable + "." + SqlIdentifierUtil.quote(f.getName()))
-              .collect(java.util.stream.Collectors.joining(", "));
-      // Add NOW() for _inserted_at value
-      selectColumns = selectColumns + ", NOW()";
+      var columnNamesList = new java.util.ArrayList<String>();
+      var selectColumnsList = new java.util.ArrayList<String>();
+      for (var f : dataFields) {
+        columnNamesList.add(SqlIdentifierUtil.quote(f.getName()));
+        selectColumnsList.add(tempTable + "." + SqlIdentifierUtil.quote(f.getName()));
+      }
+      // Add _inserted_at with NOW() value
+      columnNamesList.add(SqlIdentifierUtil.quote(DucklakeTableManager.INSERTED_AT_COLUMN));
+      selectColumnsList.add("NOW()");
+      var columnNames = String.join(", ", columnNamesList);
+      var selectColumns = String.join(", ", selectColumnsList);
 
       var sql = new StringBuilder();
       sql.append("INSERT INTO ")
