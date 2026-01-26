@@ -30,6 +30,11 @@ public final class DucklakeWriter implements AutoCloseable {
 
   private static final Logger LOG = LoggerFactory.getLogger(DucklakeWriter.class);
 
+  /** Returns true if the column is a system column that should be excluded from INSERT/MERGE. */
+  private static boolean isSystemColumn(String name) {
+    return name.equalsIgnoreCase(DucklakeTableManager.INSERTED_AT_COLUMN);
+  }
+
   private final DuckDBConnection connection;
   private final DucklakeWriterConfig config;
   private final DucklakeTableManager tableManager;
@@ -104,9 +109,11 @@ public final class DucklakeWriter implements AutoCloseable {
           java.util.Arrays.stream(pkCols)
               .map(c -> c.toLowerCase(java.util.Locale.ROOT))
               .collect(java.util.stream.Collectors.toSet());
+      // Filter out system columns (like _inserted_at) from non-key fields for UPDATE
       var nonKey =
           fields.stream()
               .filter(f -> !pkSet.contains(f.getName().toLowerCase(java.util.Locale.ROOT)))
+              .filter(f -> !isSystemColumn(f.getName()))
               .toList();
       var updateSetClause =
           nonKey.isEmpty()
@@ -120,14 +127,23 @@ public final class DucklakeWriter implements AutoCloseable {
                               + "."
                               + SqlIdentifierUtil.quote(f.getName()))
                   .collect(Collectors.joining(", "));
+      // Filter out system columns from INSERT columns (we'll add them explicitly with NOW())
+      var dataFields = fields.stream().filter(f -> !isSystemColumn(f.getName())).toList();
       var insertCols =
-          fields.stream()
+          dataFields.stream()
               .map(f -> tempTable + "." + SqlIdentifierUtil.quote(f.getName()))
               .collect(Collectors.joining(", "));
+      // Add NOW() for _inserted_at column
+      insertCols = insertCols + ", NOW()";
       var targetCols =
-          fields.stream()
+          dataFields.stream()
               .map(f -> SqlIdentifierUtil.quote(f.getName()))
               .collect(Collectors.joining(", "));
+      // Add _inserted_at to target columns
+      targetCols =
+          targetCols
+              + ", "
+              + SqlIdentifierUtil.quote(DucklakeTableManager.INSERTED_AT_COLUMN);
       var sql = new StringBuilder();
       sql.append("MERGE INTO ")
           .append(tableQuoted)
@@ -174,14 +190,21 @@ public final class DucklakeWriter implements AutoCloseable {
       connection.registerArrowStream(tempTable, arrayStream);
 
       // Build simple INSERT INTO ... SELECT FROM tempTable
+      // Filter out system columns (we'll add _inserted_at explicitly with NOW())
+      var dataFields = fields.stream().filter(f -> !isSystemColumn(f.getName())).toList();
       var columnNames =
-          fields.stream()
+          dataFields.stream()
               .map(f -> SqlIdentifierUtil.quote(f.getName()))
               .collect(java.util.stream.Collectors.joining(", "));
+      // Add _inserted_at to target columns
+      columnNames =
+          columnNames + ", " + SqlIdentifierUtil.quote(DucklakeTableManager.INSERTED_AT_COLUMN);
       var selectColumns =
-          fields.stream()
+          dataFields.stream()
               .map(f -> tempTable + "." + SqlIdentifierUtil.quote(f.getName()))
               .collect(java.util.stream.Collectors.joining(", "));
+      // Add NOW() for _inserted_at value
+      selectColumns = selectColumns + ", NOW()";
 
       var sql = new StringBuilder();
       sql.append("INSERT INTO ")

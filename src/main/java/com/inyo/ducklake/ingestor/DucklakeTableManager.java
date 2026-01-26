@@ -44,6 +44,9 @@ public final class DucklakeTableManager {
 
   private static final Logger LOG = LoggerFactory.getLogger(DucklakeTableManager.class);
 
+  /** System column that captures when records are inserted into DuckLake. */
+  public static final String INSERTED_AT_COLUMN = "_inserted_at";
+
   // Per-table locks to allow concurrent operations on different tables
   private static final ConcurrentHashMap<String, Object> TABLE_LOCKS = new ConcurrentHashMap<>();
 
@@ -191,6 +194,9 @@ public final class DucklakeTableManager {
         .append(SqlIdentifierUtil.quote(config.destinationTable()))
         .append(" (");
     ddl.append(cols);
+    // Add system column for tracking when records are inserted
+    // Note: DuckLake doesn't support DEFAULT NOW(), so value is set explicitly during INSERT
+    ddl.append(", ").append(SqlIdentifierUtil.quote(INSERTED_AT_COLUMN)).append(" TIMESTAMP");
     // PRIMARY KEY constraints are not supported in DuckLake, removing the constraint definition
     ddl.append(")");
 
@@ -218,6 +224,8 @@ public final class DucklakeTableManager {
         arrowSchema.getFields().stream()
             .map(f -> f.getName().toLowerCase(Locale.ROOT))
             .collect(Collectors.toCollection(HashSet::new));
+    // Also include the system column in the cache
+    columnSet.add(INSERTED_AT_COLUMN.toLowerCase(Locale.ROOT));
     KNOWN_COLUMNS.put(tableKey, ConcurrentHashMap.newKeySet());
     KNOWN_COLUMNS.get(tableKey).addAll(columnSet);
   }
@@ -260,6 +268,30 @@ public final class DucklakeTableManager {
         }
       }
     }
+    // Ensure _inserted_at system column exists for existing tables
+    // Note: DuckLake doesn't support DEFAULT NOW(), so value is set explicitly during INSERT
+    final var insertedAtColLower = INSERTED_AT_COLUMN.toLowerCase(Locale.ROOT);
+    if (!existing.containsKey(insertedAtColLower)) {
+      final var insertedAtDdl =
+          "ALTER TABLE "
+              + qualifiedTableRef()
+              + " ADD COLUMN "
+              + SqlIdentifierUtil.quote(INSERTED_AT_COLUMN)
+              + " TIMESTAMP";
+      LOG.info("Adding system column: {}", insertedAtDdl);
+      try (final var st = connection.createStatement()) {
+        st.execute(insertedAtDdl);
+        knownCols.add(insertedAtColLower);
+      } catch (SQLException e) {
+        LOG.error(
+            "Failed to add system column {} to table: {}",
+            INSERTED_AT_COLUMN,
+            qualifiedTableRef(),
+            e);
+        throw e;
+      }
+    }
+
     if (newColumns.isEmpty()) {
       return;
     }
