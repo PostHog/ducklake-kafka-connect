@@ -422,7 +422,8 @@ class DucklakeTableManagerTest {
 
     // Verify table was recreated (now includes _inserted_at column)
     assertTrue(mgr.tableExists(tableName), "Table should exist after recovery");
-    assertEquals(Set.of("id", "name", DucklakeTableManager.INSERTED_AT_COLUMN), getColumns(tableName));
+    assertEquals(
+        Set.of("id", "name", DucklakeTableManager.INSERTED_AT_COLUMN), getColumns(tableName));
   }
 
   private Set<String> getColumns(String table) throws Exception {
