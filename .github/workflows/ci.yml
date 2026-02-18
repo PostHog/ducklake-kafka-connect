@@ -311,23 +311,16 @@ jobs:
         run: echo "short=$(git rev-parse --short HEAD)" >> $GITHUB_OUTPUT
 
       - name: Generate release notes
-        id: notes
-        env:
-          COMMIT_MESSAGE: ${{ github.event.head_commit.message }}
-          COMMIT_SHA: ${{ github.sha }}
-          AUTHOR_NAME: ${{ github.event.head_commit.author.name }}
         run: |
           {
-            echo "notes<<EOF"
             echo "## Changes"
             echo ""
-            echo "$COMMIT_MESSAGE"
+            git log -1 --format='%B'
             echo ""
             echo "---"
-            echo "**Commit:** $COMMIT_SHA"
-            echo "**Author:** $AUTHOR_NAME"
-            echo "EOF"
-          } >> "$GITHUB_OUTPUT"
+            echo "**Commit:** ${{ github.sha }}"
+            echo "**Author:** $(git log -1 --format='%an')"
+          } > release-notes.md
 
       - name: Calculate next version
         id: version
@@ -353,7 +346,7 @@ jobs:
             build/distributions/*.zip
           tag_name: ${{ steps.version.outputs.version }}
           name: ${{ steps.version.outputs.version }} (${{ steps.sha.outputs.short }})
-          body: ${{ steps.notes.outputs.notes }}
+          body_path: release-notes.md
           draft: false
           prerelease: false
         env:
